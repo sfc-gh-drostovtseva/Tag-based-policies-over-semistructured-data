@@ -1,0 +1,199 @@
+//-----------------------------------------------------------------------
+// Demonstrate
+// 1. Loading HL7 data
+// 2. Querying HL7 data in its native format
+// 3. Automatically classifying PII elements
+// 4. Applying tags 
+// 5. Creating and applying row- and column level policies
+//-----------------------------------------------------------------------
+
+
+//------------------------------------------------------//
+// Ingest Semi-Structured JSON Data into SNowflake
+//------------------------------------------------------//
+use role accountadmin;
+
+create or replace database HL7DEMO;
+use database HL7DEMO;
+use warehouse compute_wh;
+
+--external stage for raw and exported data
+create stage if not exists HL7Data
+ url = 's3://drostovtseva/FHIRData/'
+ storage_integration=s3_int
+ directory = (enable = true auto_refresh = true);//HL7 FHIR Demo
+ 
+--list the contents of the stage
+list  @HL7Data;
+ 
+ --create table for HL7 data via JSON
+CREATE OR REPLACE TABLE HL7DEMO.public.PATIENT_STU3_V3_0_1
+    (V VARIANT )
+    COMMENT='FHIR RELEASE V3.0.1 RECORDS; DATA GENERATED USING SYNTHEA DATA GENERATOR (HTTPS://SYNTHETICHEALTH.GITHUB.IO/SYNTHEA/)';
+ 
+
+--create file format for json
+CREATE OR REPLACE FILE FORMAT "HL7DEMO"."PUBLIC".JSON
+  TYPE = 'JSON'
+  COMPRESSION = 'AUTO'
+  ENABLE_OCTAL = FALSE
+  ALLOW_DUPLICATE = FALSE
+  STRIP_OUTER_ARRAY = FALSE
+  STRIP_NULL_VALUES = FALSE
+  IGNORE_UTF8_ERRORS = FALSE;
+ 
+--copy data from HL7_DATA stage
+copy into HL7DEMO.public.PATIENT_STU3_V3_0_1
+    from @hl7data
+    file_format = (format_name = 'json');
+
+
+//------------------------------------------------------//
+// Query JSON data
+//------------------------------------------------------//
+
+--select raw JSON - data was loaded in a raw JSON form
+select *
+    from HL7DEMO.public.Patient_stu3_v3_0_1
+    limit 5;
+
+-- to view an example of an individual record, open this in Firefox: file:///Users/drostovtseva/Documents/DemoData/FHIR%20Demo/FHIR%20JSON%20Examples/Patient.json
+
+--create view of patient_demographics - traverse JSON to select demographic attributes of interest
+CREATE OR REPLACE VIEW HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS AS
+    SELECT
+        V:entry[0].fullUrl::string PATIENT_ID,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Medical Record Number',IDENTIFIER.VALUE:value::string)) PATIENT_MRN,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Social Security Number',IDENTIFIER.VALUE:value::string)) PATIENT_SSN,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Driver\'s License',IDENTIFIER.VALUE:value::string)) PATIENT_DRIVERS_LICENSE_NUM,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Passport Number',IDENTIFIER.VALUE:value::string)) PATIENT_PASSPORT_NUM,
+        UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].family::string))) PATIENT_LAST_NM,
+        UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].given[0]::string))) PATIENT_FIRST_NM,
+        UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].prefix[0]::string))) PATIENT_NM_PREFIX,
+        ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:gender::string)) PATIENT_SEX,
+        TRUNC(ANY_VALUE(PATIENT_FLAT.VALUE:resource:birthDate::date),'D') PATIENT_BIRTH_DT,
+        TRUNC(ANY_VALUE(PATIENT_FLAT.VALUE:resource:deceasedDateTime::date),'D') PATIENT_DEATH_DT,
+        UPPER(ANY_VALUE(DECODE(PATIENT_FLAT.VALUE:resource:deceasedDateTime::date,NULL,'Unknown','true'))) PATIENT_DECEASED_IND,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:line[0]::string)) PATIENT_ADDR_LINE1,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:city::string)) PATIENT_CITY,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:state::string)) PATIENT_STATE,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:country::string)) PATIENT_COUNTRY,
+        ANY_VALUE(ADDRESS.VALUE:postalCode::string) PATIENT_POSTAL_CD
+     FROM PATIENT_STU3_V3_0_1
+        , LATERAL FLATTEN(INPUT => V:entry) PATIENT_FLAT
+        , LATERAL FLATTEN(INPUT => PATIENT_FLAT.VALUE:resource:identifier) IDENTIFIER
+        , LATERAL FLATTEN(INPUT => PATIENT_FLAT.VALUE:resource:address) ADDRESS
+    WHERE UPPER(PATIENT_FLAT.VALUE:resource:resourceType::string) = 'PATIENT'
+    GROUP BY
+    PATIENT_ID;
+
+select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 10;
+
+//<maybe add some calculations on this data here>
+
+
+//------------------------------------------------------//
+// Classify data elements using automatic classification
+//------------------------------------------------------//
+
+create schema governance;
+use schema governance;
+  
+create table hl7demo.governance.semantic_categories(v variant) if not exists as 
+select extract_semantic_categories('"HL7DEMO"."PUBLIC"."PATIENT_DEMOGRAPHICS"');
+
+--review the classification results
+select 
+key as column_name, 
+value:semantic_category as semantic_category, 
+value:privacy_category as privacy_category,
+value:extra_info:probability as probability
+from hl7demo.governance.semantic_categories, lateral flatten(input=>v);
+
+--update classification results
+--...
+--...
+--
+
+//--------------------------------------------------------------//
+//Create and apply the tag dynamically based on privacy category
+//--------------------------------------------------------------//
+
+--create a PII tag
+create or replace tag hl7demo.governance.PII allowed_values 'Yes','No';
+
+--script to dynamically apply the tag to columns in the Patient_Demographics view
+declare
+    col_nm string;
+    c1 cursor for
+        select 
+            key as column_name
+            from hl7demo.governance.semantic_categories, lateral flatten(input=>v)
+            where value:privacy_category <> 'NULL';
+    sql string;
+    
+begin
+    for record in c1 do
+        col_nm := record.column_name;
+        
+        sql := 
+        $$ alter view HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS modify
+           column $$||:col_nm||$$ set tag PII='Yes';
+        $$
+        ;
+        execute immediate (:sql);
+    end for;
+return 'Success';
+end;
+
+--confirm that the columns were tagged
+select system$get_tag('HL7DEMO.GOVERNANCE.PII', 'HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS.PATIENT_LAST_NM', 'COLUMN');
+
+--look at all tags across account
+select * from snowflake.account_usage.tag_references
+order by tag_name;
+
+//------------------------------------------------------//
+// Create and apply masking policies
+//------------------------------------------------------//
+
+--create policies for masking data
+--note that the policy is based on the user current role, but it can also be based on other criteria
+create or replace masking policy HL7DEMO.GOVERNANCE.MASK_STRING as
+  (val string) returns string ->
+  case
+    when current_role() in ('ACCOUNTADMIN') then val
+      else '**masked**'
+    end;
+    
+create or replace masking policy HL7DEMO.GOVERNANCE.MASK_INT as
+  (val integer) returns integer ->
+  case
+    when current_role() in ('ACCOUNTADMIN') then val
+      else -999999
+    end;
+
+--apply masking policied to customer tag -  a very fast and efficient method
+--note that we are applying plicies to the tag, so all columns with this tag will be masked
+--alternatively, the tags could be applied to specific columns
+alter tag HL7DEMO.GOVERNANCE.PII set
+masking policy mask_string,
+masking policy mask_int;
+
+
+--test the policies
+use role accountadmin;
+grant usage on database hl7demo to role analyst;
+grant usage on schema hl7demo.public to role analyst;
+grant select on view hl7demo.public.patient_demographics to role analyst;
+grant usage on warehouse compute_wh to role analyst;
+
+use role analyst;
+use warehouse compute_wh;
+select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 5;
+
+//clean up
+use role accountadmin;
+drop database hl7demo;
+
+
