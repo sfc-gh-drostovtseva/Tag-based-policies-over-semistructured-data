@@ -43,10 +43,14 @@ CREATE OR REPLACE FILE FORMAT "HL7DEMO"."PUBLIC".JSON
   IGNORE_UTF8_ERRORS = FALSE;
  
 --copy data from HL7_DATA stage
+
+alter warehouse compute_wh set warehouse_size=Large;
+
 copy into HL7DEMO.public.PATIENT_STU3_V3_0_1
     from @hl7data
     file_format = (format_name = 'json');
 
+alter warehouse compute_wh set warehouse_size=XSmall;
 
 //------------------------------------------------------//
 // Query JSON data
@@ -66,7 +70,6 @@ CREATE OR REPLACE VIEW HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS AS
         MIN(DECODE(IDENTIFIER.VALUE:type.text,'Medical Record Number',IDENTIFIER.VALUE:value::string)) PATIENT_MRN,
         MIN(DECODE(IDENTIFIER.VALUE:type.text,'Social Security Number',IDENTIFIER.VALUE:value::string)) PATIENT_SSN,
         MIN(DECODE(IDENTIFIER.VALUE:type.text,'Driver\'s License',IDENTIFIER.VALUE:value::string)) PATIENT_DRIVERS_LICENSE_NUM,
-        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Passport Number',IDENTIFIER.VALUE:value::string)) PATIENT_PASSPORT_NUM,
         UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].family::string))) PATIENT_LAST_NM,
         UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].given[0]::string))) PATIENT_FIRST_NM,
         UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].prefix[0]::string))) PATIENT_NM_PREFIX,
@@ -98,11 +101,14 @@ select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 10;
 
 create schema governance;
 use schema governance;
-  
-create table hl7demo.governance.semantic_categories(v variant) if not exists as 
+ 
+--classify data using automatic classification 
+create or replace table hl7demo.governance.semantic_categories(v variant) as
 select extract_semantic_categories('"HL7DEMO"."PUBLIC"."PATIENT_DEMOGRAPHICS"');
 
 --review the classification results
+select * from hl7demo.governance.semantic_categories;  --results come back as a JSON
+--parse json to view classification results
 select 
 key as column_name, 
 value:semantic_category as semantic_category, 
@@ -111,18 +117,41 @@ value:extra_info:probability as probability
 from hl7demo.governance.semantic_categories, lateral flatten(input=>v);
 
 --update classification results
---...
---...
---
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_ADDR_LINE1',object_insert(object_insert(v:PATIENT_ADDR_LINE1,'semantic_category','US_STREET_ADDRESS',true),'privacy_category','IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_BIRTH_DT',object_insert(object_insert(v:PATIENT_BIRTH_DT,'semantic_category','DATE_OF_BIRTH',true),'privacy_category','QUASI_IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_LAST_NM',object_insert(object_insert(v:PATIENT_LAST_NM,'semantic_category','NAME',true),'privacy_category','IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_PASSPORT_NUM',object_insert(object_insert(v:PATIENT_PASSPORT_NUM,'semantic_category','US_PASSPORT_NUMBER',true),'privacy_category','IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_SSN',object_insert(object_insert(v:PATIENT_SSN,'semantic_category','US_SSN',true),'privacy_category','IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_ID',object_insert(object_insert(v:PATIENT_ID,'semantic_category',NULL,true),'privacy_category','IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_MRN',object_insert(object_insert(v:PATIENT_SSN,'semantic_category',NULL,true),'privacy_category','IDENTIFIER',true),true);
+update hl7demo.governance.semantic_categories
+set v = object_insert(v,'PATIENT_SEX',object_insert(object_insert(v:PATIENT_SEX,'semantic_category','GENDER',true),'privacy_category',NULL,true),true);
+
 
 //--------------------------------------------------------------//
-//Create and apply the tag dynamically based on privacy category
+// Dynamically tag columns based on privacy category
 //--------------------------------------------------------------//
 
---create a PII tag
+--associate_semantic_category_tags is a built-in stored procedure that applies the tags
+call associate_semantic_category_tags('"HL7DEMO"."PUBLIC"."PATIENT_DEMOGRAPHICS"',(select * from hl7demo.governance.semantic_categories));
+
+--confirm that the tags have been applied
+use schema public;
+select tag_name, tag_value, column_name, object_name
+from table(HL7DEMO.information_schema.tag_references('PATIENT_DEMOGRAPHICS.PATIENT_BIRTH_DT','COLUMN'));
+
+
+--Alternatively, we can create a custom tag, for example, "PII"
 create or replace tag hl7demo.governance.PII allowed_values 'Yes','No';
 
---script to dynamically apply the tag to columns in the Patient_Demographics view
+--and then dynamically apply the tag to columns in the Patient_Demographics view based on their privacy category
 declare
     col_nm string;
     c1 cursor for
@@ -138,7 +167,7 @@ begin
         
         sql := 
         $$ alter view HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS modify
-           column $$||:col_nm||$$ set tag PII='Yes';
+           column $$||:col_nm||$$ set tag hl7demo.governance.PII='Yes';
         $$
         ;
         execute immediate (:sql);
@@ -146,7 +175,7 @@ begin
 return 'Success';
 end;
 
---confirm that the columns were tagged
+--confirm that the columns were tagged - check column PATIENT_LAST_NM
 select system$get_tag('HL7DEMO.GOVERNANCE.PII', 'HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS.PATIENT_LAST_NM', 'COLUMN');
 
 --look at all tags across account
@@ -157,43 +186,165 @@ order by tag_name;
 // Create and apply masking policies
 //------------------------------------------------------//
 
+--create PII user role
+create or replace role PII_USER;
+grant role PII_USER to user john; --your name here
+
 --create policies for masking data
 --note that the policy is based on the user current role, but it can also be based on other criteria
 create or replace masking policy HL7DEMO.GOVERNANCE.MASK_STRING as
   (val string) returns string ->
   case
-    when current_role() in ('ACCOUNTADMIN') then val
+    when current_role() in ('PII_USER') then val
       else '**masked**'
     end;
     
 create or replace masking policy HL7DEMO.GOVERNANCE.MASK_INT as
   (val integer) returns integer ->
   case
-    when current_role() in ('ACCOUNTADMIN') then val
+    when current_role() in ('PII_USER') then val
       else -999999
     end;
 
+create or replace masking policy HL7DEMO.GOVERNANCE.MASK_DATE as
+  (val date) returns date ->
+  case
+    when current_role() in ('PII_USER') then val
+      else date_trunc('YEAR', val)
+    end;
+
 --apply masking policied to customer tag -  a very fast and efficient method
---note that we are applying plicies to the tag, so all columns with this tag will be masked
---alternatively, the tags could be applied to specific columns
+--note that we are applying policies to the tag, so all columns with this tag will be masked
+--alternatively, the policies could be applied to specific columns
 alter tag HL7DEMO.GOVERNANCE.PII set
-masking policy mask_string,
-masking policy mask_int;
+masking policy HL7DEMO.GOVERNANCE.mask_string,
+masking policy HL7DEMO.GOVERNANCE.mask_int,
+masking policy HL7DEMO.GOVERNANCE.mask_date
+;
 
 
---test the policies
+--test masking policies with a role of analyst
 use role accountadmin;
-grant usage on database hl7demo to role analyst;
-grant usage on schema hl7demo.public to role analyst;
-grant select on view hl7demo.public.patient_demographics to role analyst;
-grant usage on warehouse compute_wh to role analyst;
+grant usage on database hl7demo to role PII_USER;
+grant usage on schema hl7demo.public to role PII_USER;
+grant select on view hl7demo.public.patient_demographics to role PII_USER;
+grant usage on warehouse compute_wh to role PII_USER;
 
-use role analyst;
+use role PII_USER;
 use warehouse compute_wh;
-select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 5;
+select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 5; --PII user can see unmasked data
 
-//clean up
+use role accountadmin;
+select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 5; --admin user sees masked data
+
+--unset policies:
+alter tag HL7DEMO.GOVERNANCE.PII unset
+masking policy HL7DEMO.GOVERNANCE.mask_string,
+masking policy HL7DEMO.GOVERNANCE.mask_int,
+masking policy HL7DEMO.GOVERNANCE.mask_date
+;
+
+//------------------------------------------------------//
+// Create row access policies
+//------------------------------------------------------//
+
+--first, we will update the view and add a PLAN_ID column. We will use the PLAN_ID to create row-access policies
+CREATE OR REPLACE VIEW HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS AS
+    SELECT
+        V:entry[0].fullUrl::string PATIENT_ID,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Medical Record Number',IDENTIFIER.VALUE:value::string)) PATIENT_MRN,
+        CASE 
+            WHEN SUBSTR(PATIENT_MRN,1,1) in ('1','2','3','4','5') THEN 'MCO_1' 
+            ELSE 'MCO_2' 
+            END AS PLAN_ID,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Social Security Number',IDENTIFIER.VALUE:value::string)) PATIENT_SSN,
+        MIN(DECODE(IDENTIFIER.VALUE:type.text,'Driver\'s License',IDENTIFIER.VALUE:value::string)) PATIENT_DRIVERS_LICENSE_NUM,
+        UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].family::string))) PATIENT_LAST_NM,
+        UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].given[0]::string))) PATIENT_FIRST_NM,
+        UPPER(ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:name[0].prefix[0]::string))) PATIENT_NM_PREFIX,
+        ANY_VALUE(UPPER(PATIENT_FLAT.VALUE:resource:gender::string)) PATIENT_SEX,
+        TRUNC(ANY_VALUE(PATIENT_FLAT.VALUE:resource:birthDate::date),'D') PATIENT_BIRTH_DT,
+        TRUNC(ANY_VALUE(PATIENT_FLAT.VALUE:resource:deceasedDateTime::date),'D') PATIENT_DEATH_DT,
+        UPPER(ANY_VALUE(DECODE(PATIENT_FLAT.VALUE:resource:deceasedDateTime::date,NULL,'Unknown','true'))) PATIENT_DECEASED_IND,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:line[0]::string)) PATIENT_ADDR_LINE1,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:city::string)) PATIENT_CITY,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:state::string)) PATIENT_STATE,
+        UPPER(ANY_VALUE(ADDRESS.VALUE:country::string)) PATIENT_COUNTRY,
+        ANY_VALUE(ADDRESS.VALUE:postalCode::string) PATIENT_POSTAL_CD
+     FROM PATIENT_STU3_V3_0_1
+        , LATERAL FLATTEN(INPUT => V:entry) PATIENT_FLAT
+        , LATERAL FLATTEN(INPUT => PATIENT_FLAT.VALUE:resource:identifier) IDENTIFIER
+        , LATERAL FLATTEN(INPUT => PATIENT_FLAT.VALUE:resource:address) ADDRESS
+    WHERE UPPER(PATIENT_FLAT.VALUE:resource:resourceType::string) = 'PATIENT'
+    GROUP BY
+    PATIENT_ID;
+
+--confirm that the PLAN_ID has been added
+select * from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS limit 10;
+
+--what's the breakdown by MCO?
+select PLAN_ID, count(*)
+from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS
+group by 1;
+
+--create an entitlement table
+create or replace table entitlement_table (
+  PLAN string,
+  MCO_ROLE string
+);
+
+insert into entitlement_table 
+values
+('MCO_1','ACCOUNTADMIN'), --accountadmin will see all rows
+('MCO_2','ACCOUNTADMIN'),
+('MCO_1','MCO_1_ROLE'),
+('MCO_2','MCO_2_ROLE')
+;
+
+--confirm the entitlement table looks correct
+select * from entitlement_table;
+
+--create row access policy
+create or replace row access policy PLAN_POLICY as (PLAN_ID varchar) returns boolean ->
+ exists (
+ select 1 from entitlement_table
+ where MCO_ROLE = current_role()
+ and PLAN_ID = PLAN 
+ )
+;
+
+--apply policy to the view
+alter view HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS add row access policy PLAN_POLICY on (PLAN_ID);
+
+--test the policy
+create or replace role MCO_1_ROLE;
+grant role MCO_1_ROLE to user john; --your name here
+
+grant usage on database hl7demo to role MCO_1_ROLE;
+grant usage on schema hl7demo.public to role MCO_1_ROLE;
+grant select on view hl7demo.public.patient_demographics to role MCO_1_ROLE;
+grant usage on warehouse compute_wh to role MCO_1_ROLE;
+
+use role MCO_1_ROLE;
+use warehouse compute_wh;
+
+select PLAN_ID, count(*) 
+from HL7DEMO.PUBLIC.PATIENT_DEMOGRAPHICS
+group by 1; --User with MCO_1_ROLE role can see only MCO_1 data
+
+
+//------------------------------------------------------//
+// Clean Up
+//------------------------------------------------------//
 use role accountadmin;
 drop database hl7demo;
 
-
+// What we have accomplished:
+// 1. Loaded semi-structured JSON data in HL7 format from an S3 bucket
+// 2. Queried HL7 data in its native format using simple dot notation
+// 3. Automatically classified data elements and updated classifications where necessary
+// 4. Created both system-generated and custom tags
+// 5. Created masking policies and applied them to the tag to minimize management
+// 6. Confirmed that the data is masked according to the user role
+// 7. Created row access policy and applied it to HL7 data based on an entitlement table
+// 8. Confirmed that the row access policy works according to the user role
